@@ -63,6 +63,10 @@ gpu_tainted: bool = False
 gpu_taint_generation: int = 0
 recovery_timer_handle: Optional[asyncio.TimerHandle] = None
 
+# Telemetry State for Concurrency/Queue Tracking
+queue_depth: int = 0
+active_inferences: int = 0
+
 is_healthy: bool = True
 health_failure_reason: Optional[str] = None
 
@@ -384,7 +388,7 @@ async def get_model_entry(requested_name: str) -> Optional[ModelEntry]:
 
 
 async def run_inference(image_bytes: bytes, min_conf: float, model_name: str, t_start: float):
-    global gpu_tainted, gpu_taint_generation, recovery_timer_handle
+    global gpu_tainted, gpu_taint_generation, recovery_timer_handle, queue_depth, active_inferences
 
     if not is_healthy:
         return {"success": False, "error": f"Gateway shutting down: {health_failure_reason}", "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
@@ -399,29 +403,39 @@ async def run_inference(image_bytes: bytes, min_conf: float, model_name: str, t_
     except Exception as e:
         return {"success": False, "error": f"Bad request/corrupt image: {e}", "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
 
-    async with gpu_lock:
-        if gpu_tainted:
-            return {"success": False, "error": "GPU frozen.", "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
+    queue_depth += 1
+    try:
+        async with gpu_lock:
+            queue_depth -= 1
+            active_inferences += 1
+            try:
+                if gpu_tainted:
+                    return {"success": False, "error": "GPU frozen.", "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
 
-        loop = asyncio.get_running_loop()
-        t_infer_start = time.perf_counter()
-        worker_future = loop.run_in_executor(None, sync_predict, entry.model, img, min_conf, entry.is_pt)
+                loop = asyncio.get_running_loop()
+                t_infer_start = time.perf_counter()
+                worker_future = loop.run_in_executor(None, sync_predict, entry.model, img, min_conf, entry.is_pt)
 
-        try:
-            results = await asyncio.wait_for(asyncio.shield(worker_future), timeout=INFERENCE_TIMEOUT)
-            t_infer_end = time.perf_counter()
-        except asyncio.TimeoutError:
-            gpu_tainted = True
-            gpu_taint_generation += 1
-            current_gen = gpu_taint_generation
-            msg = f"Inference timed out after {INFERENCE_TIMEOUT}s on '{model_name}'."
-            logger.error(msg)
-            worker_future.add_done_callback(lambda fut, gen=current_gen: on_orphaned_worker_done(fut, gen))
-            recovery_timer_handle = loop.call_later(RECOVERY_GRACE_PERIOD, lambda gen=current_gen: on_grace_period_expired(gen))
-            return {"success": False, "error": msg, "inferenceMs": int((time.perf_counter() - t_infer_start) * 1000), "processMs": int((time.perf_counter() - t_start) * 1000)}
-        except Exception as e:
-            logger.error(f"Inference error on '{model_name}': {e}", exc_info=True)
-            return {"success": False, "error": str(e), "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
+                try:
+                    results = await asyncio.wait_for(asyncio.shield(worker_future), timeout=INFERENCE_TIMEOUT)
+                    t_infer_end = time.perf_counter()
+                except asyncio.TimeoutError:
+                    gpu_tainted = True
+                    gpu_taint_generation += 1
+                    current_gen = gpu_taint_generation
+                    msg = f"Inference timed out after {INFERENCE_TIMEOUT}s on '{model_name}'."
+                    logger.error(msg)
+                    worker_future.add_done_callback(lambda fut, gen=current_gen: on_orphaned_worker_done(fut, gen))
+                    recovery_timer_handle = loop.call_later(RECOVERY_GRACE_PERIOD, lambda gen=current_gen: on_grace_period_expired(gen))
+                    return {"success": False, "error": msg, "inferenceMs": int((time.perf_counter() - t_infer_start) * 1000), "processMs": int((time.perf_counter() - t_start) * 1000)}
+                except Exception as e:
+                    logger.error(f"Inference error on '{model_name}': {e}", exc_info=True)
+                    return {"success": False, "error": str(e), "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
+            finally:
+                active_inferences -= 1
+    except asyncio.CancelledError:
+        queue_depth -= 1
+        raise
 
     infer_ms = int((t_infer_end - t_infer_start) * 1000)
     process_ms = int((time.perf_counter() - t_start) * 1000)
@@ -557,6 +571,8 @@ async def detailed_status(response: Response):
         "status": "ok" if (is_healthy and not gpu_tainted) else "degraded",
         "canUseGPU": True,
         "executionProvider": "CUDA",
+        "queue_depth": queue_depth,
+        "active_inferences": active_inferences,
         "models": {k: {"status": "ready", "format": v.format_name} for k, v in loaded_models.items()},
         "registered_faces": sorted(list(registered_faces.keys())),
     }
