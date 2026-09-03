@@ -115,7 +115,7 @@ def ensure_tensorrt_engine(stem: str):
         logger.info(f"Compiling optimized TensorRT engine for '{stem}' on RTX 5060 Ti (Takes ~60-90s)...")
         try:
             model = YOLO(str(pt_path))
-            model.export(format="engine", device=0, half=HALF_PRECISION, imgsz=640, dynamic=False)
+            model.export(format="engine", device=0, quantize=(16 if HALF_PRECISION else 32), imgsz=640, dynamic=False)
             stamp_path.write_text(current_version)
             logger.info(f"Successfully compiled and cached: {engine_path.name}")
         except Exception as e:
@@ -130,7 +130,7 @@ def sync_predict(model: YOLO, img: Image.Image, min_conf: float, is_pt: bool):
         "verbose": False,
     }
     if is_pt and HALF_PRECISION:
-        kwargs["half"] = True
+        kwargs["quantize"] = 16
 
     return model.predict(img, **kwargs)
 
@@ -541,12 +541,17 @@ async def face_delete(
 ):
     global _face_cache_dirty
     target_id = (userid or name or "").strip()
-    if target_id in registered_faces:
+
+    # Route through gpu_lock so this can't race with _rebuild_face_matrix()
+    # iterating registered_faces inside a recognize() call's worker thread.
+    async with gpu_lock:
+        if target_id not in registered_faces:
+            return {"success": False, "error": f"User '{target_id}' not found."}
         del registered_faces[target_id]
         _face_cache_dirty = True
-        save_faces_db()
-        return {"success": True, "message": f"Face deleted for {target_id}"}
-    return {"success": False, "error": f"User '{target_id}' not found."}
+        await asyncio.to_thread(save_faces_db)
+
+    return {"success": True, "message": f"Face deleted for {target_id}"}
 
 
 @app.post("/v1/vision/face/recognize")
