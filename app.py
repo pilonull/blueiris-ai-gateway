@@ -17,6 +17,12 @@ import tensorrt
 import torch
 import torch.nn.functional as F
 from ultralytics import YOLO
+from ultralytics import settings as yolo_settings
+
+# Disable Ultralytics' anonymous analytics/crash reporting. Doesn't persist
+# via settings.json since that path isn't a mounted volume, so it's set
+# here in code to survive container rebuilds.
+yolo_settings.update({"sync": False})
 
 # --- Logging Setup ---
 logging.basicConfig(
