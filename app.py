@@ -26,6 +26,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("bi-gateway")
 
+# Input tensor shapes are fixed (YOLO @ imgsz=640, FaceNet crops @ 160x160),
+# so let cuDNN autotune and cache the fastest conv algorithms for them.
+torch.backends.cudnn.benchmark = True
+
 # --- Configuration ---
 MODELS_DIR = Path("/app/models")
 FACES_DB_PATH = MODELS_DIR / "faces_db.pt"
@@ -56,6 +60,12 @@ cache_lock = asyncio.Lock()
 face_detector: Optional[MTCNN] = None
 face_recognizer: Optional[InceptionResnetV1] = None
 registered_faces: Dict[str, List[torch.Tensor]] = {}
+
+# Flattened (all users' embeddings stacked into one matrix) cache used for
+# fast batched matching, so we don't rebuild + re-loop per detected face.
+_face_matrix_cache: Optional[torch.Tensor] = None
+_face_labels_cache: List[str] = []
+_face_cache_dirty: bool = True
 
 # Global GPU Execution Gate & Watchdog State
 gpu_lock = asyncio.Lock()
@@ -105,7 +115,7 @@ def ensure_tensorrt_engine(stem: str):
         logger.info(f"Compiling optimized TensorRT engine for '{stem}' on RTX 5060 Ti (Takes ~60-90s)...")
         try:
             model = YOLO(str(pt_path))
-            model.export(format="engine", device=0, quantize=16, imgsz=640, dynamic=False)
+            model.export(format="engine", device=0, half=HALF_PRECISION, imgsz=640, dynamic=False)
             stamp_path.write_text(current_version)
             logger.info(f"Successfully compiled and cached: {engine_path.name}")
         except Exception as e:
@@ -120,7 +130,7 @@ def sync_predict(model: YOLO, img: Image.Image, min_conf: float, is_pt: bool):
         "verbose": False,
     }
     if is_pt and HALF_PRECISION:
-        kwargs["quantize"] = 16
+        kwargs["half"] = True
 
     return model.predict(img, **kwargs)
 
@@ -150,7 +160,7 @@ def save_faces_db():
 
 def load_faces_db():
     """Loads enrolled face embeddings from disk on boot."""
-    global registered_faces
+    global registered_faces, _face_cache_dirty
     if FACES_DB_PATH.exists():
         try:
             registered_faces = torch.load(FACES_DB_PATH, map_location="cpu", weights_only=False)
@@ -158,10 +168,32 @@ def load_faces_db():
         except Exception as e:
             logger.error(f"Error loading {FACES_DB_PATH}: {e}")
             registered_faces = {}
+    _face_cache_dirty = True
+
+
+def _rebuild_face_matrix():
+    """Stacks every enrolled embedding into one (M, D) matrix + parallel label list.
+
+    Rebuilt lazily (only when dirty) so recognize() can do a single batched
+    matmul against all enrolled faces instead of looping + torch.cat-ing
+    per user, per detected face, on every request.
+    """
+    global _face_matrix_cache, _face_labels_cache, _face_cache_dirty
+    labels: List[str] = []
+    mats: List[torch.Tensor] = []
+    for user, embs in registered_faces.items():
+        for e in embs:
+            mats.append(e)
+            labels.append(user)
+
+    _face_matrix_cache = torch.cat(mats, dim=0).to("cuda:0") if mats else None
+    _face_labels_cache = labels
+    _face_cache_dirty = False
 
 
 def sync_face_register(img: Image.Image, user_id: str) -> bool:
     """Extracts face embedding via MTCNN + InceptionResnetV1 and registers it."""
+    global _face_cache_dirty
     assert face_detector is not None and face_recognizer is not None
     boxes, _ = face_detector.detect(img)
     if boxes is None or len(boxes) == 0:
@@ -179,6 +211,7 @@ def sync_face_register(img: Image.Image, user_id: str) -> bool:
     if user_id not in registered_faces:
         registered_faces[user_id] = []
     registered_faces[user_id].append(emb)
+    _face_cache_dirty = True
     save_faces_db()
     return True
 
@@ -199,29 +232,31 @@ def sync_face_recognize(img: Image.Image, min_conf: float) -> List[dict]:
         embeddings = face_recognizer(faces)
         embeddings = F.normalize(embeddings, p=2, dim=1)
 
+    if _face_cache_dirty:
+        _rebuild_face_matrix()
+
+    # Both sides are already L2-normalized, so a plain dot product is
+    # equivalent to cosine similarity. One (N faces, D) @ (D, M enrolled)
+    # matmul replaces the old per-user, per-face torch.cat + cosine loop.
+    if _face_matrix_cache is not None:
+        sims = embeddings @ _face_matrix_cache.T
+        best_sims, best_idx = sims.max(dim=1)
+    else:
+        best_sims = best_idx = None
+
     predictions = []
     for i, box in enumerate(boxes):
         x1, y1, x2, y2 = box.tolist()
-        emb = embeddings[i : i + 1]
 
-        best_user = "unknown"
-        best_sim = 0.0
-
-        for user, user_embs in registered_faces.items():
-            if not user_embs:
-                continue
-            db_tensor = torch.cat(user_embs, dim=0).to("cuda:0")
-            similarities = F.cosine_similarity(emb, db_tensor)
-            max_sim = float(similarities.max().item())
-
-            if max_sim > best_sim:
-                best_sim = max_sim
-                best_user = user
-
-        matched_id = best_user if best_sim >= min_conf else "unknown"
+        if best_sims is not None:
+            sim = float(best_sims[i].item())
+            matched_id = _face_labels_cache[int(best_idx[i].item())] if sim >= min_conf else "unknown"
+        else:
+            sim = 0.0
+            matched_id = "unknown"
 
         predictions.append({
-            "confidence": round(best_sim, 2),
+            "confidence": round(sim, 2),
             "userid": matched_id,
             "label": matched_id,
             "x_min": int(max(0, x1)),
@@ -399,7 +434,7 @@ async def run_inference(image_bytes: bytes, min_conf: float, model_name: str, t_
         entry = await get_model_entry(model_name)
         if entry is None:
             return {"success": False, "error": f"Model '{model_name}' is not loaded or available on server.", "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        img = await asyncio.to_thread(lambda: Image.open(io.BytesIO(image_bytes)).convert("RGB"))
     except Exception as e:
         return {"success": False, "error": f"Bad request/corrupt image: {e}", "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
 
@@ -486,7 +521,7 @@ async def face_register(
 
     contents = await image.read()
     try:
-        img = Image.open(io.BytesIO(contents)).convert("RGB")
+        img = await asyncio.to_thread(lambda: Image.open(io.BytesIO(contents)).convert("RGB"))
     except Exception as e:
         return {"success": False, "error": f"Invalid image: {e}"}
 
@@ -504,9 +539,11 @@ async def face_delete(
     userid: Optional[str] = Form(None),
     name: Optional[str] = Form(None),
 ):
+    global _face_cache_dirty
     target_id = (userid or name or "").strip()
     if target_id in registered_faces:
         del registered_faces[target_id]
+        _face_cache_dirty = True
         save_faces_db()
         return {"success": True, "message": f"Face deleted for {target_id}"}
     return {"success": False, "error": f"User '{target_id}' not found."}
@@ -521,7 +558,7 @@ async def face_recognize(
     contents = await image.read()
 
     try:
-        img = Image.open(io.BytesIO(contents)).convert("RGB")
+        img = await asyncio.to_thread(lambda: Image.open(io.BytesIO(contents)).convert("RGB"))
     except Exception as e:
         return {"success": False, "error": f"Invalid image: {e}", "inferenceMs": 0, "processMs": int((time.perf_counter() - t_start) * 1000)}
 
